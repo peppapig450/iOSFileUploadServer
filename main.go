@@ -49,6 +49,9 @@ func main() {
 	bindAddress := flag.String("bind", "0.0.0.0", "IP address to bind the server to")
 	flag.Parse()
 
+	// Configure logging with timestamp and additional details
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
 	// Ensure the upload directory exists
 	if err := os.MkdirAll(*dir, os.ModePerm); err != nil {
 		log.Fatalf("Error creating upload directory: %v", err)
@@ -61,7 +64,7 @@ func main() {
 	corsHandler := func(handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Get the client's IP address
-			clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+			clientIP, clientPort, err := net.SplitHostPort(r.RemoteAddr)
 			if err != nil {
 				http.Error(w, "Invalid client address", http.StatusForbidden)
 				return
@@ -69,9 +72,34 @@ func main() {
 
 			// Check if the client is on a private network
 			if !isPrivateNetworkIP(clientIP) {
-				http.Error(w, "Access denied", http.StatusForbidden)
+				// Enhanced logging for denied requests
+				log.Printf("DENIED REQUEST: External network access attempt\n"+
+					"  IP: %s\n"+
+					"  Port: %s\n"+
+					"  Method: %s\n"+
+					"  Path: %s\n"+
+					"  User-Agent: %s",
+					clientIP,
+					clientPort,
+					r.Method,
+					r.URL.Path,
+					r.UserAgent(),
+				)
+				http.Error(w, "Access denied: Not on local network", http.StatusForbidden)
 				return
 			}
+
+			// Log successful network check
+			log.Printf("ALLOWED REQUEST: Local network access\n"+
+				"  IP: %s\n"+
+				"  Port: %s\n"+
+				"  Method: %s\n"+
+				"  Path: %s",
+				clientIP,
+				clientPort,
+				r.Method,
+				r.URL.Path,
+			)
 
 			// CORS headers for local network
 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
