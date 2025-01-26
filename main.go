@@ -61,9 +61,11 @@ func main() {
 			log.Printf("DENIED: Unauthorized upload attempt\n"+
 				"  Method: %s\n"+
 				"  Path: %s\n"+
+				"  Headers: %+v\n"+
 				"  User-Agent: %s",
 				r.Method,
 				r.URL.Path,
+				r.Header,
 				r.UserAgent(),
 			)
 			return
