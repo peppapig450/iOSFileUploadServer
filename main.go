@@ -1,12 +1,12 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,31 +14,11 @@ import (
 	"time"
 )
 
-// Private network IP ranges
-var privateNetworkRanges = []string{
-	"10.0.0.0/8",     // Class A private networks
-	"172.16.0.0/12",  // Class B private networks
-	"192.168.0.0/16", // Class C private networks
-}
-
-func isPrivateNetworkIP(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip != nil {
-		return false
-	}
-
-	for _, cidrStr := range privateNetworkRanges {
-		_, subnet, err := net.ParseCIDR(cidrStr)
-		if err != nil {
-			log.Printf("Error parsing CIDR: %v", err)
-			continue
-		}
-
-		if subnet.Contains(ip) {
-			return true
-		}
-	}
-	return false
+type ServerConfig struct {
+	uploadDir     string
+	port          string
+	maxUploadSize int64
+	authToken     string
 }
 
 func main() {
@@ -46,8 +26,14 @@ func main() {
 	dir := flag.String("dir", "uploads", "Directory to save uploaded files")
 	port := flag.String("port", "9090", "Port to run the server on")
 	maxUploadSize := flag.Int64("max-size", 50<<20, "Maximum upload file size bytes (default 50MB)")
-	bindAddress := flag.String("bind", "0.0.0.0", "IP address to bind the server to")
 	flag.Parse()
+
+	authToken := os.Getenv("UPLOAD_SERVER_AUTHTOKEN")
+
+	// Validate that an auth token is provided
+	if authToken == "" {
+		log.Fatalf("ERROR: An authentication token must be provided. Make sure environment variable is set.")
+	}
 
 	// Configure logging with timestamp and additional details
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
@@ -57,92 +43,91 @@ func main() {
 		log.Fatalf("Error creating upload directory: %v", err)
 	}
 
-	// Create a custom ServeMux for more flexible routing
+	// Create server configuration
+	config := ServerConfig{
+		uploadDir:     *dir,
+		port:          *port,
+		maxUploadSize: *maxUploadSize,
+		authToken:     authToken,
+	}
+	// Create a custom ServeMux for routing
 	mux := http.NewServeMux()
 
-	// Add CORS headers middleware
-	corsHandler := func(handler http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Get the client's IP address
-			clientIP, clientPort, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				http.Error(w, "Invalid client address", http.StatusForbidden)
-				return
-			}
-
-			// Check if the client is on a private network
-			if !isPrivateNetworkIP(clientIP) {
-				// Enhanced logging for denied requests
-				log.Printf("DENIED REQUEST: External network access attempt\n"+
-					"  IP: %s\n"+
-					"  Port: %s\n"+
-					"  Method: %s\n"+
-					"  Path: %s\n"+
-					"  User-Agent: %s",
-					clientIP,
-					clientPort,
-					r.Method,
-					r.URL.Path,
-					r.UserAgent(),
-				)
-				http.Error(w, "Access denied: Not on local network", http.StatusForbidden)
-				return
-			}
-
-			// Log successful network check
-			log.Printf("ALLOWED REQUEST: Local network access\n"+
-				"  IP: %s\n"+
-				"  Port: %s\n"+
+	// Add routes with authentication
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		// Authenticate the request
+		if !config.authenticateRequest(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			log.Printf("DENIED: Unauthorized upload attempt\n"+
 				"  Method: %s\n"+
-				"  Path: %s",
-				clientIP,
-				clientPort,
+				"  Path: %s\n"+
+				"  User-Agent: %s",
 				r.Method,
 				r.URL.Path,
+				r.UserAgent(),
 			)
+			return
+		}
 
-			// CORS headers for local network
-			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-
-			// Handle preflight requests
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-
-			handler.ServeHTTP(w, r)
-		})
-
-	}
-	// Add routes
-	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
-		uploadHandler(w, r, *dir, *maxUploadSize)
+		// Process upload if authenticated
+		uploadHandler(w, r, config.uploadDir, config.maxUploadSize)
 	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "File server is running on port %s. Use /upload to upload files.", *port)
+		fmt.Fprintf(w, "File server is running on port %s. Use /upload to upload files.", config.port)
 	})
-
-	// Wrap the handler with CORS middleware
-	handler := corsHandler(mux)
 
 	// Configure server with timeouts
 	server := &http.Server{
-		Addr:         fmt.Sprintf("%s:%s", *bindAddress, *port),
-		Handler:      handler,
+		Addr:         ":" + config.port,
+		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  10 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Starting server on  %s:%s", *bindAddress, *port)
+	log.Printf("Starting server on  %s", *port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Error starting server: %v", err)
 	}
+}
+
+// authenticateRequest checks if the provided token is valid
+func (c *ServerConfig) authenticateRequest(r *http.Request) bool {
+	// Check token in multiple places for flexibility
+
+	// 1. Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if c.compareToken(token) {
+			return true
+		}
+	}
+
+	// 2. Query parameter
+	if c.compareToken(r.URL.Query().Get("token")) {
+		return true
+	}
+
+	// 3. Form/Multipart value
+	if err := r.ParseMultipartForm(10 << 20); err == nil {
+		if c.compareToken(r.FormValue("token")) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// compareToken uses constant-time comparison to prevent timing attacks
+func (c *ServerConfig) compareToken(providedToken string) bool {
+	return subtle.ConstantTimeCompare(
+		[]byte(providedToken),
+		[]byte(c.authToken),
+	) == 1
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUploadSize int64) {
