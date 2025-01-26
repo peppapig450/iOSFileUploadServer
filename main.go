@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,11 +14,39 @@ import (
 	"time"
 )
 
+// Private network IP ranges
+var privateNetworkRanges = []string{
+	"10.0.0.0/8",     // Class A private networks
+	"172.16.0.0/12",  // Class B private networks
+	"192.168.0.0/16", // Class C private networks
+}
+
+func isPrivateNetworkIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip != nil {
+		return false
+	}
+
+	for _, cidrStr := range privateNetworkRanges {
+		_, subnet, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			log.Printf("Error parsing CIDR: %v", err)
+			continue
+		}
+
+		if subnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	// Define and parse command-line flags
 	dir := flag.String("dir", "uploads", "Directory to save uploaded files")
 	port := flag.String("port", "9090", "Port to run the server on")
 	maxUploadSize := flag.Int64("max-size", 50<<20, "Maximum upload file size bytes (default 50MB)")
+	bindAddress := flag.String("bind", "0.0.0.0", "IP address to bind the server to")
 	flag.Parse()
 
 	// Ensure the upload directory exists
@@ -28,6 +57,38 @@ func main() {
 	// Create a custom ServeMux for more flexible routing
 	mux := http.NewServeMux()
 
+	// Add CORS headers middleware
+	corsHandler := func(handler http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Get the client's IP address
+			clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				http.Error(w, "Invalid client address", http.StatusForbidden)
+				return
+			}
+
+			// Check if the client is on a private network
+			if !isPrivateNetworkIP(clientIP) {
+				http.Error(w, "Access denied", http.StatusForbidden)
+				return
+			}
+
+			// CORS headers for local network
+			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+			// Handle preflight requests
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			handler.ServeHTTP(w, r)
+		})
+
+	}
 	// Add routes
 	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		uploadHandler(w, r, *dir, *maxUploadSize)
@@ -38,16 +99,19 @@ func main() {
 		fmt.Fprintf(w, "File server is running on port %s. Use /upload to upload files.", *port)
 	})
 
+	// Wrap the handler with CORS middleware
+	handler := corsHandler(mux)
+
 	// Configure server with timeouts
 	server := &http.Server{
-		Addr:         ":" + *port,
-		Handler:      mux,
+		Addr:         fmt.Sprintf("%s:%s", *bindAddress, *port),
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  10 * time.Second,
 	}
 
-	log.Printf("Starting server on port %s", *port)
+	log.Printf("Starting server on  %s:%s", *bindAddress, *port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Error starting server: %v", err)
 	}
