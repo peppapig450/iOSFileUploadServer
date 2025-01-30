@@ -19,6 +19,18 @@ type ServerConfig struct {
 	port          string
 	maxUploadSize int64
 	authToken     string
+	debug         bool
+}
+
+// debugLogger wraps our logging functionality
+type debugLogger struct {
+	enabled bool
+}
+
+func (d *debugLogger) Printf(format string, v ...interface{}) {
+	if d.enabled {
+		log.Printf("[DEBUG] "+format, v...)
+	}
 }
 
 func main() {
@@ -26,6 +38,7 @@ func main() {
 	dir := flag.String("dir", "uploads", "Directory to save uploaded files")
 	port := flag.String("port", "9090", "Port to run the server on")
 	maxUploadSize := flag.Int64("max-size", 50<<20, "Maximum upload file size bytes (default 50MB)")
+	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
 	authToken := os.Getenv("UPLOAD_SERVER_AUTHTOKEN")
@@ -38,6 +51,11 @@ func main() {
 	// Configure logging with timestamp and additional details
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
+	// Initialize debug logger
+	debugLog := &debugLogger{enabled: *debug}
+	if *debug {
+		log.Printf("Debug logging enabled")
+	}
 	// Ensure the upload directory exists
 	if err := os.MkdirAll(*dir, os.ModePerm); err != nil {
 		log.Fatalf("Error creating upload directory: %v", err)
@@ -49,14 +67,18 @@ func main() {
 		port:          *port,
 		maxUploadSize: *maxUploadSize,
 		authToken:     authToken,
+		debug:         *debug,
 	}
 	// Create a custom ServeMux for routing
 	mux := http.NewServeMux()
 
 	// Add routes with authentication
 	mux.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		if config.debug {
+			dumpRequestDetails(r, debugLog)
+		}
 		// Authenticate the request
-		if !config.authenticateRequest(r) {
+		if !config.authenticateRequest(r, debugLog) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			log.Printf("DENIED: Unauthorized upload attempt\n"+
 				"  Method: %s\n"+
@@ -72,10 +94,13 @@ func main() {
 		}
 
 		// Process upload if authenticated
-		uploadHandler(w, r, config.uploadDir, config.maxUploadSize)
+		uploadHandler(w, r, config.uploadDir, config.maxUploadSize, debugLog)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if config.debug {
+			dumpRequestDetails(r, debugLog)
+		}
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "File server is running on port %s. Use /upload to upload files.", config.port)
@@ -90,37 +115,77 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	debugLog.Printf("Server configuration: %+v", config)
 	log.Printf("Starting server on  %s", *port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Error starting server: %v", err)
 	}
 }
 
+// dumpRequestDetails logs detailed information about the incoming request
+func dumpRequestDetails(r *http.Request, debugLog *debugLogger) {
+	debugLog.Printf("Incoming connection details:")
+	debugLog.Printf("  Remote Address: %s", r.RemoteAddr)
+	debugLog.Printf("  Method: %s", r.Method)
+	debugLog.Printf("  URL: %s", r.URL.String())
+	debugLog.Printf("  Protocol: %s", r.Proto)
+	debugLog.Printf("  Host: %s", r.Host)
+	debugLog.Printf("  Headers:")
+	for name, headers := range r.Header {
+		for _, h := range headers {
+			debugLog.Printf("    %s: %s", name, h)
+		}
+	}
+	debugLog.Printf("  ContentLength: %d", r.ContentLength)
+	debugLog.Printf("  TransferEncoding: %v", r.TransferEncoding)
+	debugLog.Printf("  TLS Connection: %v", r.TLS != nil)
+	if r.TLS != nil {
+		debugLog.Printf("    TLS Version: %x", r.TLS.Version)
+		debugLog.Printf("    TLS CipherSuite: %x", r.TLS.CipherSuite)
+		debugLog.Printf("    TLS Server Name: %s", r.TLS.ServerName)
+	}
+}
+
 // authenticateRequest checks if the provided token is valid
-func (c *ServerConfig) authenticateRequest(r *http.Request) bool {
+func (c *ServerConfig) authenticateRequest(r *http.Request, debugLog *debugLogger) bool {
+	debugLog.Printf("Attempting authentication for request from %s", r.RemoteAddr)
 	// Check token in multiple places for flexibility
 
 	// 1. Authorization header
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
+		debugLog.Printf("Found Bearer token in Authorization header")
 		if c.compareToken(token) {
+			debugLog.Printf("Bearer token authentication successful")
 			return true
 		}
+		debugLog.Printf("Bearer token authentication failed")
 	}
 
 	// 2. Query parameter
-	if c.compareToken(r.URL.Query().Get("token")) {
-		return true
+	if token := r.URL.Query().Get("token"); token != "" {
+		debugLog.Printf("Found token in query parameters")
+		if c.compareToken(token) {
+			debugLog.Printf("Query parameter token authentication successful")
+			return true
+		}
+		debugLog.Printf("Query parameter token authentication failed")
 	}
 
 	// 3. Form/Multipart value
 	if err := r.ParseMultipartForm(10 << 20); err == nil {
-		if c.compareToken(r.FormValue("token")) {
-			return true
+		if token := r.FormValue("token"); token != "" {
+			debugLog.Printf("Found token in form data")
+			if c.compareToken(token) {
+				debugLog.Printf("Form token authentication successful")
+				return true
+			}
+			debugLog.Printf("Form token authentication failed")
 		}
 	}
 
+	debugLog.Printf("All authentication methods failed")
 	return false
 }
 
@@ -132,18 +197,22 @@ func (c *ServerConfig) compareToken(providedToken string) bool {
 	) == 1
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUploadSize int64) {
+func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUploadSize int64, debugLog *debugLogger) {
 	// Validate request method
 	if r.Method != http.MethodPost {
+		debugLog.Printf("Invalid request method: %s", r.Method)
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
+
+	debugLog.Printf("Processing upload request from %s", r.RemoteAddr)
 
 	// Limit total request body size
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
 	// Parse multipart form
 	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+		debugLog.Printf("Failed to parse multipart form: %v", err)
 		http.Error(w, "File too large", http.StatusBadRequest)
 		return
 	}
@@ -154,8 +223,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUpload
 
 	// Check for base64 content
 	if base64Content := r.FormValue("base64"); base64Content != "" {
+		debugLog.Printf("Processing base64 encoded content")
 		filename = r.FormValue("filename")
 		if filename == "" {
+			debugLog.Printf("Missing filename for base64 content")
 			http.Error(w, "Missing filename for base64 content", http.StatusBadRequest)
 			return
 		}
@@ -163,45 +234,55 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUpload
 		// Decode base64 content
 		content, err = base64.StdEncoding.DecodeString(base64Content)
 		if err != nil {
-			log.Printf("Error decoding base64 content: %v", err)
+			debugLog.Printf("Error decoding base64 content: %v", err)
 			http.Error(w, fmt.Sprintf("Error saving base64 file: %v", err), http.StatusInternalServerError)
 			return
 		}
+		debugLog.Printf("Successfully decoded base64 content of size %d bytes", len(content))
 	} else {
-		// Handle fiel uploads
+		// Handle file uploads
 		file, handler, fileErr := r.FormFile("file")
 		if fileErr != nil {
-			log.Printf("Error retrieving the file: %v", fileErr)
+			debugLog.Printf("Error retrieving the file: %v", fileErr)
 			http.Error(w, "Error retrieving file", http.StatusBadRequest)
 			return
 		}
 		defer file.Close()
 
 		filename = handler.Filename
+		debugLog.Printf("Processing file upload: %s (size: %d)", filename, handler.Size)
+
 		content, err = io.ReadAll(file)
 		if err != nil {
-			log.Printf("Error reading file content: %v", err)
+			debugLog.Printf("Error reading file content: %v", err)
 			http.Error(w, "Error reading file", http.StatusInternalServerError)
 			return
 		}
+		debugLog.Printf("Successfully read file content of size %d bytes", len(content))
 	}
 
 	// Validate file size
 	if int64(len(content)) > maxUploadSize {
+		debugLog.Printf("File size %d exceeds maximum allowed size %d", len(content), maxUploadSize)
 		http.Error(w, "File too large", http.StatusBadRequest)
 		return
 	}
 
 	// Sanitize filename
+	originalFilename := filename
 	filename = sanitizeFilename(filename)
+	if originalFilename != filename {
+		debugLog.Printf("Sanitized filename from %q to %q", originalFilename, filename)
+	}
 
 	// Save the file
 	if err := saveFile(dir, filename, content); err != nil {
-		log.Printf("Failed to save file %q: %v", filename, err)
+		debugLog.Printf("Failed to save file %q: %v", filename, err)
 		http.Error(w, "Error saving file", http.StatusInternalServerError)
 		return
 	}
 
+	debugLog.Printf("Successfully saved file %q (%d bytes) to %s", filename, len(content), dir)
 	log.Printf("File %s uploaded successfully", filename)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "File %s uploaded successfully!", filename)
