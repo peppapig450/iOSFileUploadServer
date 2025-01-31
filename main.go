@@ -227,7 +227,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUpload
 
 	// Handle base64 content if present
 	if base64Content := r.FormValue("base64"); base64Content != "" {
-		debugLog.Printf("Processing base64 encoded")
+		debugLog.Printf("Processing base64 encoded content")
 		filename := r.FormValue("filename")
 		if filename == "" {
 			debugLog.Printf("Missing filename for base64 content")
@@ -239,7 +239,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUpload
 		content, err := base64.StdEncoding.DecodeString(base64Content)
 		if err != nil {
 			debugLog.Printf("Error decoding base64 content: %v", err)
-			http.Error(w, fmt.Sprintf("Error decoding base64 content: %v", err), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("Error decoding base64 file: %v", err), http.StatusBadRequest)
 			return
 		}
 
