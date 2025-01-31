@@ -217,14 +217,18 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUpload
 		return
 	}
 
-	var content []byte
-	var filename string
-	var err error
+	// Track upload results
+	type uploadResult struct {
+		filename string
+		size     int
+		err      error
+	}
+	var results []uploadResult
 
-	// Check for base64 content
+	// Handle base64 content if present
 	if base64Content := r.FormValue("base64"); base64Content != "" {
-		debugLog.Printf("Processing base64 encoded content")
-		filename = r.FormValue("filename")
+		debugLog.Printf("Processing base64 encoded")
+		filename := r.FormValue("filename")
 		if filename == "" {
 			debugLog.Printf("Missing filename for base64 content")
 			http.Error(w, "Missing filename for base64 content", http.StatusBadRequest)
@@ -232,60 +236,106 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, dir string, maxUpload
 		}
 
 		// Decode base64 content
-		content, err = base64.StdEncoding.DecodeString(base64Content)
+		content, err := base64.StdEncoding.DecodeString(base64Content)
 		if err != nil {
 			debugLog.Printf("Error decoding base64 content: %v", err)
-			http.Error(w, fmt.Sprintf("Error saving base64 file: %v", err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("Error decoding base64 content: %v", err), http.StatusBadRequest)
 			return
 		}
-		debugLog.Printf("Successfully decoded base64 content of size %d bytes", len(content))
+
+		// Save base64 file
+		sanitizedFilename := sanitizeFilename(filename)
+		err = saveFile(dir, sanitizedFilename, content)
+		results = append(results, uploadResult{
+			filename: sanitizedFilename,
+			size:     len(content),
+			err:      err,
+		})
+	}
+
+	// Handle multiple file uploads
+	if files := r.MultipartForm.File["file"]; len(files) > 0 {
+		debugLog.Printf("Processing %d files from multipart form", len(files))
+
+		for _, fileHeader := range files {
+			debugLog.Printf("Processing file: %s (size: %d)", fileHeader.Filename, fileHeader.Size)
+
+			// Validate individual file size
+			if fileHeader.Size > maxUploadSize {
+				debugLog.Printf("File %s exceeds size limit (%d > %d)", fileHeader.Filename, fileHeader.Size, maxUploadSize)
+				results = append(results, uploadResult{
+					filename: fileHeader.Filename,
+					size:     int(fileHeader.Size),
+					err:      fmt.Errorf("file exceeds maximum size of %d bytes", maxUploadSize),
+				})
+				continue
+			}
+
+			// Open the file
+			file, err := fileHeader.Open()
+			if err != nil {
+				debugLog.Printf("Error opening file %s: %v", fileHeader.Filename, err)
+				results = append(results, uploadResult{
+					filename: fileHeader.Filename,
+					size:     int(fileHeader.Size),
+					err:      err,
+				})
+				continue
+			}
+			defer file.Close()
+
+			// Read file content
+			content, err := io.ReadAll(file)
+			if err != nil {
+				debugLog.Printf("Error reading file %s: %v", fileHeader.Filename, err)
+				results = append(results, uploadResult{
+					filename: fileHeader.Filename,
+					size:     int(fileHeader.Size),
+					err:      err,
+				})
+				continue
+			}
+
+			// Sanitize filename and save
+			sanitizedFilename := sanitizeFilename(fileHeader.Filename)
+			err = saveFile(dir, sanitizedFilename, content)
+			results = append(results, uploadResult{
+				filename: sanitizedFilename,
+				size:     len(content),
+				err:      err,
+			})
+		}
+	}
+
+	// Return results
+	if len(results) == 0 {
+		debugLog.Printf("No files were processed")
+		http.Error(w, "No files were uploaded", http.StatusBadRequest)
+		return
+	}
+
+	// Generate response
+	w.Header().Set("Content-Type", "text/plain")
+
+	// Check for any errors
+	hasErrors := false
+	var response strings.Builder
+	for _, result := range results {
+		if result.err != nil {
+			hasErrors = true
+			response.WriteString(fmt.Sprintf("Failed to upload %s: %v\n", result.filename, result.err))
+		} else {
+			response.WriteString(fmt.Sprintf("Successfully uploaded %s (%d bytes)\n", result.filename, result.size))
+			debugLog.Printf("Successfully saved file %q (%d bytes) to %s", result.filename, result.size, dir)
+		}
+	}
+
+	if hasErrors {
+		w.WriteHeader(http.StatusPartialContent)
 	} else {
-		// Handle file uploads
-		file, handler, fileErr := r.FormFile("file")
-		if fileErr != nil {
-			debugLog.Printf("Error retrieving the file: %v", fileErr)
-			http.Error(w, "Error retrieving file", http.StatusBadRequest)
-			return
-		}
-		defer file.Close()
-
-		filename = handler.Filename
-		debugLog.Printf("Processing file upload: %s (size: %d)", filename, handler.Size)
-
-		content, err = io.ReadAll(file)
-		if err != nil {
-			debugLog.Printf("Error reading file content: %v", err)
-			http.Error(w, "Error reading file", http.StatusInternalServerError)
-			return
-		}
-		debugLog.Printf("Successfully read file content of size %d bytes", len(content))
+		w.WriteHeader(http.StatusOK)
 	}
-
-	// Validate file size
-	if int64(len(content)) > maxUploadSize {
-		debugLog.Printf("File size %d exceeds maximum allowed size %d", len(content), maxUploadSize)
-		http.Error(w, "File too large", http.StatusBadRequest)
-		return
-	}
-
-	// Sanitize filename
-	originalFilename := filename
-	filename = sanitizeFilename(filename)
-	if originalFilename != filename {
-		debugLog.Printf("Sanitized filename from %q to %q", originalFilename, filename)
-	}
-
-	// Save the file
-	if err := saveFile(dir, filename, content); err != nil {
-		debugLog.Printf("Failed to save file %q: %v", filename, err)
-		http.Error(w, "Error saving file", http.StatusInternalServerError)
-		return
-	}
-
-	debugLog.Printf("Successfully saved file %q (%d bytes) to %s", filename, len(content), dir)
-	log.Printf("File %s uploaded successfully", filename)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "File %s uploaded successfully!", filename)
+	fmt.Fprintf(w, response.String())
 }
 
 // saveFile saves the given content to a file in the specified directory
